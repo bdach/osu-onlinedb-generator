@@ -1,7 +1,9 @@
 using System.Net.Http;
 using System;
+using System.Collections.Generic;
 using System.Data;
 using System.IO;
+using System.Linq;
 using Amazon;
 using Amazon.Runtime;
 using Amazon.S3;
@@ -9,6 +11,16 @@ using Amazon.S3.Model;
 using Dapper;
 using Microsoft.Data.Sqlite;
 using MySqlConnector;
+using Newtonsoft.Json;
+using osu.Game.Beatmaps;
+using osu.Game.Beatmaps.Legacy;
+using osu.Game.Online.API;
+using osu.Game.Rulesets;
+using osu.Game.Rulesets.Catch;
+using osu.Game.Rulesets.Mania;
+using osu.Game.Rulesets.Mods;
+using osu.Game.Rulesets.Osu;
+using osu.Game.Rulesets.Taiko;
 using SharpCompress.Compressors;
 using SharpCompress.Compressors.BZip2;
 
@@ -85,7 +97,7 @@ namespace osu.Server.OnlineDbGenerator
         private void createSchema(SqliteConnection sqlite)
         {
             sqlite.Execute("CREATE TABLE `schema_version` (`number` smallint unsigned NOT NULL)");
-            sqlite.Execute("INSERT INTO `schema_version` (`number`) VALUES (3)");
+            sqlite.Execute("INSERT INTO `schema_version` (`number`) VALUES (4)");
 
             sqlite.Execute(
                 """
@@ -145,6 +157,16 @@ namespace osu.Server.OnlineDbGenerator
                     `beatmap_id` mediumint unsigned NOT NULL,
                     `user_id` int unsigned NOT NULL,
                     PRIMARY KEY (`beatmap_id`, `user_id`))
+                """);
+
+            sqlite.Execute(
+                """
+                CREATE TABLE `beatmap_star_ratings` (
+                    `beatmap_id` mediumint unsigned NOT NULL,
+                    `ruleset_id` smallint unsigned NOT NULL,
+                    `mods` varchar(255),
+                    `star_rating` float,
+                    PRIMARY KEY (`beatmap_id`, `ruleset_id`, `mods`))
                 """);
         }
 
@@ -342,6 +364,51 @@ namespace osu.Server.OnlineDbGenerator
 
             if (destinationCount != sourceCount)
                 throw new Exception($"Expected {sourceCount} beatmap owners, but found {destinationCount} in sqlite! Aborting");
+        }
+
+        private void copyStarRatings(IDbConnection source, IDbConnection destination)
+        {
+            var acronymsMapping = new Dictionary<(int Ruleset, LegacyMods Mods), string>();
+            Ruleset[] rulesets = [new OsuRuleset(), new TaikoRuleset(), new CatchRuleset(), new ManiaRuleset()];
+
+            foreach (var ruleset in rulesets)
+            {
+                foreach (var combination in ruleset.CreateDifficultyCalculator(new FlatWorkingBeatmap(new Beatmap())).CreateDifficultyAdjustmentModCombinations())
+                {
+                    var multiMod = (MultiMod)combination;
+                    acronymsMapping[(ruleset.RulesetInfo.OnlineID, ruleset.ConvertToLegacyMods(multiMod.Mods))] = JsonConvert.SerializeObject(multiMod.Mods.Select(m => new APIMod(m)));
+                }
+            }
+
+            int sourceCount = source.QuerySingle<int>($"SELECT COUNT(1) FROM `osu_beatmap_difficulty_attributes` {beatmap_id_in_filter} AND `attrib_id` = 11", commandTimeout: 600_000);
+            Console.WriteLine($"Copying {sourceCount} star ratings...");
+
+            var start = DateTime.Now;
+            int processedItems = 0;
+
+            var sourceStarRatings = source.Query<BeatmapDifficultyRow>($"SELECT `beatmap_id`, `mode`, `mods`, `value` FROM `osu_beatmap_difficulty_attributes` {beatmap_id_in_filter} AND `attrib_id` = 11", commandTimeout: 600_000);
+
+            foreach (var starRating in sourceStarRatings)
+            {
+                destination.Execute("INSERT INTO `beatmap_star_ratings` VALUES (`beatmap_id`, `ruleset_id`, `mods`, `star_rating` VALUES (@beatmap_id, @ruleset_id, @mods, @star_rating))", new
+                {
+                    beatmap_id = starRating.beatmap_id,
+                    ruleset_id = starRating.mode,
+                    mods = acronymsMapping[(starRating.mode, (LegacyMods)starRating.mods)],
+                    star_rating = starRating.value
+                });
+
+                if (++processedItems % 1000 == 0)
+                    Console.WriteLine($"Copied {processedItems} star ratings...");
+            }
+
+            var timespan = (DateTime.Now - start).TotalMilliseconds;
+            int destinationCount = destination.QuerySingle<int>("SELECT COUNT(1) FROM `beatmap_star_ratings`");
+
+            Console.WriteLine($"Copied star ratings in {timespan}ms! (mysql:{sourceCount} sqlite:{destinationCount})");
+
+            if (destinationCount != sourceCount)
+                throw new Exception($"Expected {sourceCount} star ratings, but found {destinationCount} in sqlite! Aborting");
         }
 
         /// <summary>
